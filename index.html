@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>Glass — breath fog mirror</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; background: #090d11;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+
+  #stage { position: fixed; inset: 0; }
+  #cam   { position: absolute; inset: 0; width: 100%; height: 100%;
+           object-fit: cover; transform: scaleX(-1); background: #090d11; }
+  #fog   { position: absolute; inset: 0; width: 100%; height: 100%;
+           touch-action: none; cursor: crosshair; }
+
+  #hint  { position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
+           color: rgba(255,255,255,.62); font-size: 13.5px; letter-spacing: .03em;
+           text-align: center; pointer-events: none; transition: opacity .8s;
+           text-shadow: 0 1px 4px rgba(0,0,0,.6); white-space: nowrap; }
+  #hint b { color: rgba(255,255,255,.85); font-weight: 600; }
+
+  #status { position: fixed; top: 14px; left: 50%; transform: translateX(-50%);
+            color: rgba(255,255,255,.4); font-size: 12px; letter-spacing: .05em;
+            pointer-events: none; text-align: center; max-width: 90vw; }
+
+  #start { position: fixed; inset: 0; z-index: 10; display: flex; gap: 20px;
+           flex-direction: column; align-items: center; justify-content: center;
+           color: #eaf2f8; text-align: center; padding: 24px;
+           background: radial-gradient(circle at 50% 38%, #1a2632, #090d11 70%);
+           transition: opacity .8s; }
+  #start h1 { font-weight: 200; font-size: clamp(34px, 9vw, 56px); letter-spacing: .22em;
+              text-indent: .22em; }
+  #start p  { color: rgba(234,242,248,.6); font-weight: 300; max-width: 360px;
+              line-height: 1.65; font-size: 15px; }
+  #start button { margin-top: 6px; padding: 13px 36px; font-size: 14px; letter-spacing: .12em;
+                  color: #0a0e12; background: #eaf2f8; border: none; border-radius: 999px;
+                  cursor: pointer; transition: transform .15s ease, background .15s; }
+  #start button:hover { transform: translateY(-2px); background: #fff; }
+  #start small { color: rgba(234,242,248,.34); font-size: 12px; }
+  #err { color: #ff9a8a; font-size: 13px; min-height: 16px; max-width: 360px; }
+  .gone { opacity: 0 !important; pointer-events: none; }
+</style>
+</head>
+<body>
+  <div id="stage">
+    <video id="cam" autoplay playsinline muted></video>
+    <canvas id="fog"></canvas>
+  </div>
+
+  <div id="status"></div>
+  <div id="hint">breathe on the glass to fog it &middot; move your finger to wipe &middot; hold <b>space</b> if your mic is shy &middot; <b>c</b> clears</div>
+
+  <div id="start">
+    <h1>GLASS</h1>
+    <p>A foggy mirror in your browser. Breathe to fog it up, then draw on the glass with your fingertip.</p>
+    <button id="go">Enter</button>
+    <div id="err"></div>
+    <small>needs camera + mic &middot; everything stays on your device</small>
+  </div>
+
+<script type="module">
+import { HandLandmarker, FilesetResolver }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const video   = document.getElementById("cam");
+const canvas  = document.getElementById("fog");
+const ctx     = canvas.getContext("2d");
+const startEl = document.getElementById("start");
+const errEl   = document.getElementById("err");
+const hintEl  = document.getElementById("hint");
+const statusEl= document.getElementById("status");
+
+// ---- tunables ---------------------------------------------------------------
+const FOG_RGB        = "225,234,240";   // cool frosted white
+const INITIAL_FOG    = 0.97;            // opacity the glass starts at
+const AMBIENT_REFOG  = 0.0035;          // per-frame refog -> writing fades ~12s
+const BREATH_REFOG   = 0.045;           // extra fog per frame at full breath
+const SPACE_REFOG    = 0.05;            // fog per frame while holding space
+const BRUSH_RADIUS   = 34;              // wipe brush radius (css px)
+const VOL_GATE       = 0.045;           // min RMS to count as breath
+const FLAT_GATE      = 0.18;            // min spectral flatness (noise-like)
+// -----------------------------------------------------------------------------
+
+let w = 0, h = 0, dpr = 1;
+let handLandmarker = null;
+let lastVideoTime = -1;
+let handResult = null;
+let handLast = null;      // previous fingertip point (css px) while drawing
+let pointerLast = null;   // previous mouse/touch point while dragging
+let spaceDown = false;
+let breath = 0;           // smoothed breath intensity 0..1
+
+// ---- canvas sizing ----------------------------------------------------------
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  w = window.innerWidth; h = window.innerHeight;
+  canvas.width  = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  fillFog(INITIAL_FOG);
+}
+function fillFog(alpha) {
+  ctx.globalCompositeOperation = "source-over";
+  ctx.fillStyle = `rgba(${FOG_RGB},${alpha})`;
+  ctx.fillRect(0, 0, w, h);
+}
+window.addEventListener("resize", resize);
+
+// ---- fog rendering ----------------------------------------------------------
+function refog() {
+  let a = AMBIENT_REFOG;
+  if (spaceDown) a += SPACE_REFOG;
+  a += BREATH_REFOG * breath;
+  ctx.globalCompositeOperation = "source-over";
+  ctx.fillStyle = `rgba(${FOG_RGB},${Math.min(a, 1)})`;
+  ctx.fillRect(0, 0, w, h);
+
+  // faint grain so the fog reads as frosted condensation, not flat paint
+  if (a > 0.004) {
+    ctx.fillStyle = "rgba(255,255,255,0.02)";
+    for (let i = 0; i < 24; i++) {
+      ctx.fillRect((Math.random() * w) | 0, (Math.random() * h) | 0, 2, 2);
+    }
+  }
+}
+
+function wipeSegment(from, to) {
+  // stamp soft radial brushes along the segment for a smooth, gap-free streak
+  ctx.globalCompositeOperation = "destination-out";
+  const dist = Math.hypot(to.x - from.x, to.y - from.y);
+  const steps = Math.max(1, Math.ceil(dist / (BRUSH_RADIUS * 0.4)));
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    stamp(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t);
+  }
+}
+function stamp(x, y) {
+  const g = ctx.createRadialGradient(x, y, 0, x, y, BRUSH_RADIUS);
+  g.addColorStop(0,   "rgba(0,0,0,0.95)");
+  g.addColorStop(0.6, "rgba(0,0,0,0.45)");
+  g.addColorStop(1,   "rgba(0,0,0,0)");
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.arc(x, y, BRUSH_RADIUS, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+// ---- breath detection -------------------------------------------------------
+let analyser = null, timeBuf = null, freqBuf = null;
+function setupAudio(stream) {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  const ac = new AC();
+  if (ac.state === "suspended") ac.resume();
+  const src = ac.createMediaStreamSource(stream);
+  analyser = ac.createAnalyser();
+  analyser.fftSize = 1024;
+  analyser.smoothingTimeConstant = 0.6;
+  src.connect(analyser);
+  timeBuf = new Uint8Array(analyser.fftSize);
+  freqBuf = new Uint8Array(analyser.frequencyBinCount);
+}
+function updateBreath() {
+  let target = 0;
+  if (analyser) {
+    analyser.getByteTimeDomainData(timeBuf);
+    let sum = 0;
+    for (let i = 0; i < timeBuf.length; i++) {
+      const v = (timeBuf[i] - 128) / 128;
+      sum += v * v;
+    }
+    const rms = Math.sqrt(sum / timeBuf.length);
+
+    // spectral flatness over the low/mid band where breath lives -> noise = ~1, tone = ~0
+    analyser.getByteFrequencyData(freqBuf);
+    const band = Math.min(freqBuf.length, 220);
+    let logSum = 0, linSum = 0, n = 0;
+    for (let i = 1; i < band; i++) {
+      const m = freqBuf[i] / 255 + 1e-6;
+      logSum += Math.log(m); linSum += m; n++;
+    }
+    const flatness = n ? Math.exp(logSum / n) / (linSum / n) : 0;
+
+    if (rms > VOL_GATE && flatness > FLAT_GATE) {
+      target = Math.min(1, (rms - VOL_GATE) * 9);
+    }
+  }
+  // attack fast, release slow so fog keeps spreading a beat after the breath
+  breath += (target - breath) * (target > breath ? 0.5 : 0.06);
+  if (breath < 0.001) breath = 0;
+}
+
+// ---- main loop --------------------------------------------------------------
+function loop() {
+  // hand tracking only when a fresh video frame is available
+  if (handLandmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    try { handResult = handLandmarker.detectForVideo(video, performance.now()); }
+    catch (e) { /* transient frame errors are fine */ }
+  }
+
+  updateBreath();
+  refog();
+
+  // wipe with the index fingertip (landmark 8), mirrored to match the video
+  let handActive = false;
+  if (handResult && handResult.landmarks && handResult.landmarks.length) {
+    const tip = handResult.landmarks[0][8];
+    const p = { x: (1 - tip.x) * w, y: tip.y * h };
+    if (handLast) wipeSegment(handLast, p); else stamp(p.x, p.y);
+    handLast = p;
+    handActive = true;
+  }
+  if (!handActive) handLast = null;
+
+  requestAnimationFrame(loop);
+}
+
+// ---- pointer fallback (works without a camera) ------------------------------
+canvas.addEventListener("pointerdown", (e) => {
+  pointerLast = { x: e.clientX, y: e.clientY };
+  stamp(pointerLast.x, pointerLast.y);
+});
+canvas.addEventListener("pointermove", (e) => {
+  if (e.buttons === 0) return;
+  const p = { x: e.clientX, y: e.clientY };
+  if (pointerLast) wipeSegment(pointerLast, p);
+  pointerLast = p;
+});
+const dropPointer = () => { pointerLast = null; };
+canvas.addEventListener("pointerup", dropPointer);
+canvas.addEventListener("pointerleave", dropPointer);
+
+// ---- keys -------------------------------------------------------------------
+window.addEventListener("keydown", (e) => {
+  if (e.code === "Space") { spaceDown = true; e.preventDefault(); }
+  if (e.key === "c" || e.key === "C") { ctx.globalCompositeOperation = "destination-out";
+    ctx.fillStyle = "rgba(0,0,0,1)"; ctx.fillRect(0, 0, w, h); }
+});
+window.addEventListener("keyup", (e) => { if (e.code === "Space") spaceDown = false; });
+
+// ---- startup ----------------------------------------------------------------
+async function setupHands() {
+  const fileset = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  handLandmarker = await HandLandmarker.createFromOptions(fileset, {
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      delegate: "GPU",
+    },
+    runningMode: "VIDEO",
+    numHands: 1,
+  });
+}
+
+document.getElementById("go").addEventListener("click", async () => {
+  errEl.textContent = "";
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+    });
+    video.srcObject = stream;
+    await video.play();
+    setupAudio(stream);
+
+    resize();
+    startEl.classList.add("gone");
+    loop();                         // start the mirror immediately
+    statusEl.textContent = "loading hand tracking…";
+
+    try {
+      await setupHands();           // hand model loads in the background
+      statusEl.textContent = "";
+    } catch (e) {
+      statusEl.textContent = "hand tracking unavailable — use your mouse to wipe";
+    }
+
+    setTimeout(() => hintEl.classList.add("gone"), 9000);
+  } catch (e) {
+    errEl.textContent = "Couldn't get camera/mic access — check permissions and that you're on http://localhost.";
+    console.error(e);
+  }
+});
+</script>
+</body>
+</html>
