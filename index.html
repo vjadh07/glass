@@ -50,7 +50,7 @@
   </div>
 
   <div id="status"></div>
-  <div id="hint">breathe on the glass to fog it &middot; move your finger to wipe &middot; hold <b>space</b> if your mic is shy &middot; <b>c</b> clears</div>
+  <div id="hint">breathe on the glass to fog it &middot; <b>point</b> your index finger to write &middot; hold <b>space</b> to fog &middot; <b>c</b> clears</div>
 
   <div id="start">
     <h1>GLASS</h1>
@@ -73,14 +73,25 @@ const hintEl  = document.getElementById("hint");
 const statusEl= document.getElementById("status");
 
 // ---- tunables ---------------------------------------------------------------
-const FOG_RGB        = "225,234,240";   // cool frosted white
-const INITIAL_FOG    = 0.97;            // opacity the glass starts at
-const AMBIENT_REFOG  = 0.0035;          // per-frame refog -> writing fades ~12s
-const BREATH_REFOG   = 0.045;           // extra fog per frame at full breath
-const SPACE_REFOG    = 0.05;            // fog per frame while holding space
-const BRUSH_RADIUS   = 34;              // wipe brush radius (css px)
-const VOL_GATE       = 0.045;           // min RMS to count as breath
-const FLAT_GATE      = 0.18;            // min spectral flatness (noise-like)
+// fog appearance (a blurred, brightened, frosted copy of the live video)
+const BLUR_PX        = 14;              // how soft the fogged glass is
+const FOG_BRIGHT     = 1.45;            // fogged glass is brighter than the room
+const FOG_SAT        = 0.55;            // fog washes the colour out
+const FOG_TINT       = "rgba(228,236,244,0.40)"; // cool frosted wash
+const FROST_ALPHA    = 0.55;           // strength of the static frost texture
+
+// fog density (the persistent mask: white = fogged, erased = clear)
+const INITIAL_FOG    = 1.0;            // start fully fogged
+const AMBIENT_REFOG  = 0.0004;         // gentle haze return (~90s); writing persists
+const BREATH_REFOG   = 0.05;           // extra fog per frame at full breath
+const SPACE_REFOG    = 0.05;           // fog per frame while holding space
+
+// wiping
+const BRUSH_RADIUS   = 28;             // fingertip brush radius (css px)
+
+// breath detection
+const VOL_GATE       = 0.045;          // min RMS to count as breath
+const FLAT_GATE      = 0.18;           // min spectral flatness (noise-like)
 // -----------------------------------------------------------------------------
 
 let w = 0, h = 0, dpr = 1;
@@ -88,63 +99,152 @@ let handLandmarker = null;
 let lastVideoTime = -1;
 let handResult = null;
 let handLast = null;      // previous fingertip point (css px) while drawing
-let pointerLast = null;   // previous mouse/touch point while dragging
+let pointerDown = false, pointerPt = null, pointerLast = null;
 let spaceDown = false;
 let breath = 0;           // smoothed breath intensity 0..1
 
-// ---- canvas sizing ----------------------------------------------------------
+// offscreen layers
+const maskCanvas = document.createElement("canvas");   // fog density map
+const maskCtx    = maskCanvas.getContext("2d");
+const blurCanvas = document.createElement("canvas");   // low-res video for cheap blur
+const blurCtx    = blurCanvas.getContext("2d");
+let frostPattern = null;                               // static frosted-glass texture
+
+// ---- sizing -----------------------------------------------------------------
 function resize() {
   dpr = Math.min(window.devicePixelRatio || 1, 2);
   w = window.innerWidth; h = window.innerHeight;
-  canvas.width  = Math.round(w * dpr);
-  canvas.height = Math.round(h * dpr);
+
+  canvas.width  = maskCanvas.width  = Math.round(w * dpr);
+  canvas.height = maskCanvas.height = Math.round(h * dpr);
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  maskCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  // low-res buffer for the blurred video, same aspect as the screen
+  const bw = Math.max(160, Math.min(480, Math.round(w / 4)));
+  blurCanvas.width  = bw;
+  blurCanvas.height = Math.max(1, Math.round(bw * h / w));
+
+  frostPattern = ctx.createPattern(makeFrost(480), "repeat");
   fillFog(INITIAL_FOG);
 }
 function fillFog(alpha) {
-  ctx.globalCompositeOperation = "source-over";
-  ctx.fillStyle = `rgba(${FOG_RGB},${alpha})`;
-  ctx.fillRect(0, 0, w, h);
+  maskCtx.globalCompositeOperation = "source-over";
+  maskCtx.fillStyle = `rgba(255,255,255,${alpha})`;
+  maskCtx.fillRect(0, 0, w, h);
 }
 window.addEventListener("resize", resize);
 
-// ---- fog rendering ----------------------------------------------------------
-function refog() {
+// ---- frosted-glass texture (generated once) ---------------------------------
+function makeFrost(tile) {
+  const c = document.createElement("canvas");
+  c.width = c.height = tile;
+  const x = c.getContext("2d");
+
+  // soft dappled condensation: blur up some coarse noise
+  const s = document.createElement("canvas");
+  s.width = s.height = tile >> 2;
+  const sx = s.getContext("2d");
+  const img = sx.createImageData(s.width, s.height);
+  for (let i = 0; i < img.data.length; i += 4) {
+    img.data[i] = img.data[i + 1] = img.data[i + 2] = 255;
+    img.data[i + 3] = Math.random() * 70;            // varied droplet density
+  }
+  sx.putImageData(img, 0, 0);
+  x.filter = "blur(2px)";
+  x.drawImage(s, 0, 0, tile, tile);
+  x.filter = "none";
+
+  // fine micro-grain on top so it doesn't look smudgy
+  for (let i = 0; i < tile * tile * 0.04; i++) {
+    x.fillStyle = `rgba(255,255,255,${Math.random() * 0.05})`;
+    x.fillRect((Math.random() * tile) | 0, (Math.random() * tile) | 0, 1, 1);
+  }
+  return c;
+}
+
+// ---- fog density (mask) -----------------------------------------------------
+function refogMask() {
   let a = AMBIENT_REFOG;
   if (spaceDown) a += SPACE_REFOG;
   a += BREATH_REFOG * breath;
-  ctx.globalCompositeOperation = "source-over";
-  ctx.fillStyle = `rgba(${FOG_RGB},${Math.min(a, 1)})`;
-  ctx.fillRect(0, 0, w, h);
-
-  // faint grain so the fog reads as frosted condensation, not flat paint
-  if (a > 0.004) {
-    ctx.fillStyle = "rgba(255,255,255,0.02)";
-    for (let i = 0; i < 24; i++) {
-      ctx.fillRect((Math.random() * w) | 0, (Math.random() * h) | 0, 2, 2);
-    }
-  }
+  if (a <= 0) return;
+  maskCtx.globalCompositeOperation = "source-over";
+  maskCtx.fillStyle = `rgba(255,255,255,${Math.min(a, 1)})`;
+  maskCtx.fillRect(0, 0, w, h);
 }
-
 function wipeSegment(from, to) {
-  // stamp soft radial brushes along the segment for a smooth, gap-free streak
-  ctx.globalCompositeOperation = "destination-out";
   const dist = Math.hypot(to.x - from.x, to.y - from.y);
-  const steps = Math.max(1, Math.ceil(dist / (BRUSH_RADIUS * 0.4)));
+  const steps = Math.max(1, Math.ceil(dist / (BRUSH_RADIUS * 0.35)));
   for (let i = 0; i <= steps; i++) {
     const t = i / steps;
     stamp(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t);
   }
 }
 function stamp(x, y) {
-  const g = ctx.createRadialGradient(x, y, 0, x, y, BRUSH_RADIUS);
-  g.addColorStop(0,   "rgba(0,0,0,0.95)");
-  g.addColorStop(0.6, "rgba(0,0,0,0.45)");
-  g.addColorStop(1,   "rgba(0,0,0,0)");
-  ctx.fillStyle = g;
-  ctx.beginPath();
-  ctx.arc(x, y, BRUSH_RADIUS, 0, Math.PI * 2);
-  ctx.fill();
+  // erase the mask with a soft-edged brush -> feathered, premium wipe
+  const g = maskCtx.createRadialGradient(x, y, 0, x, y, BRUSH_RADIUS);
+  g.addColorStop(0,    "rgba(0,0,0,1)");
+  g.addColorStop(0.6,  "rgba(0,0,0,0.9)");
+  g.addColorStop(1,    "rgba(0,0,0,0)");
+  maskCtx.globalCompositeOperation = "destination-out";
+  maskCtx.fillStyle = g;
+  maskCtx.beginPath();
+  maskCtx.arc(x, y, BRUSH_RADIUS, 0, Math.PI * 2);
+  maskCtx.fill();
+}
+
+// ---- fog appearance + composite ---------------------------------------------
+function coverDrawMirrored(dctx, vid, dw, dh) {
+  const vw = vid.videoWidth || 16, vh = vid.videoHeight || 9;
+  const scale = Math.max(dw / vw, dh / vh);
+  const sw = vw * scale, sh = vh * scale;
+  const dx = (dw - sw) / 2, dy = (dh - sh) / 2;
+  dctx.setTransform(1, 0, 0, 1, 0, 0);
+  dctx.clearRect(0, 0, dw, dh);
+  dctx.translate(dw, 0); dctx.scale(-1, 1);            // mirror to match #cam
+  dctx.drawImage(vid, dw - dx - sw, dy, sw, sh);
+  dctx.setTransform(1, 0, 0, 1, 0, 0);
+}
+function compose() {
+  coverDrawMirrored(blurCtx, video, blurCanvas.width, blurCanvas.height);
+
+  ctx.save();
+  ctx.clearRect(0, 0, w, h);
+
+  // 1. fogged glass = blurred + brightened + desaturated video
+  ctx.filter = `blur(${BLUR_PX}px) brightness(${FOG_BRIGHT}) saturate(${FOG_SAT})`;
+  ctx.drawImage(blurCanvas, 0, 0, w, h);
+  ctx.filter = "none";
+
+  // 2. cool tint + frosted texture so it reads as glass, not just blur
+  ctx.fillStyle = FOG_TINT;
+  ctx.fillRect(0, 0, w, h);
+  if (frostPattern) {
+    ctx.globalAlpha = FROST_ALPHA;
+    ctx.fillStyle = frostPattern;
+    ctx.fillRect(0, 0, w, h);
+    ctx.globalAlpha = 1;
+  }
+
+  // 3. punch the wiped areas out, revealing the sharp #cam mirror below
+  ctx.globalCompositeOperation = "destination-in";
+  ctx.drawImage(maskCanvas, 0, 0, w, h);
+  ctx.restore();
+}
+
+// ---- pointing-gesture detection (wipe only with the index finger) -----------
+function isPointing(lm) {
+  const wrist = lm[0];
+  const d = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+  const extended = (tip, pip) => d(lm[tip], wrist) > d(lm[pip], wrist) * 1.1;
+  const curled   = (tip, pip) => d(lm[tip], wrist) < d(lm[pip], wrist) * 1.05;
+  if (!extended(8, 6)) return false;                  // index must be extended
+  let down = 0;                                       // and the others mostly folded
+  if (curled(12, 10)) down++;
+  if (curled(16, 14)) down++;
+  if (curled(20, 18)) down++;
+  return down >= 2;
 }
 
 // ---- breath detection -------------------------------------------------------
@@ -172,7 +272,7 @@ function updateBreath() {
     }
     const rms = Math.sqrt(sum / timeBuf.length);
 
-    // spectral flatness over the low/mid band where breath lives -> noise = ~1, tone = ~0
+    // spectral flatness over the low/mid band -> noise = ~1, tone = ~0
     analyser.getByteFrequencyData(freqBuf);
     const band = Math.min(freqBuf.length, 220);
     let logSum = 0, linSum = 0, n = 0;
@@ -193,7 +293,6 @@ function updateBreath() {
 
 // ---- main loop --------------------------------------------------------------
 function loop() {
-  // hand tracking only when a fresh video frame is available
   if (handLandmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
     lastVideoTime = video.currentTime;
     try { handResult = handLandmarker.detectForVideo(video, performance.now()); }
@@ -201,42 +300,44 @@ function loop() {
   }
 
   updateBreath();
-  refog();
+  refogMask();                                        // add fog first...
 
-  // wipe with the index fingertip (landmark 8), mirrored to match the video
-  let handActive = false;
+  // ...then wipe, so the stroke stays clear this frame
+  let handPt = null;
   if (handResult && handResult.landmarks && handResult.landmarks.length) {
-    const tip = handResult.landmarks[0][8];
-    const p = { x: (1 - tip.x) * w, y: tip.y * h };
-    if (handLast) wipeSegment(handLast, p); else stamp(p.x, p.y);
-    handLast = p;
-    handActive = true;
+    const lm = handResult.landmarks[0];
+    if (isPointing(lm)) {
+      const tip = lm[8];                              // index fingertip, mirrored
+      handPt = { x: (1 - tip.x) * w, y: tip.y * h };
+    }
   }
-  if (!handActive) handLast = null;
+  if (handPt) { if (handLast) wipeSegment(handLast, handPt); else stamp(handPt.x, handPt.y); handLast = handPt; }
+  else handLast = null;
 
+  if (pointerDown && pointerPt) {
+    if (pointerLast) wipeSegment(pointerLast, pointerPt); else stamp(pointerPt.x, pointerPt.y);
+    pointerLast = pointerPt;
+  } else pointerLast = null;
+
+  compose();
   requestAnimationFrame(loop);
 }
 
 // ---- pointer fallback (works without a camera) ------------------------------
-canvas.addEventListener("pointerdown", (e) => {
-  pointerLast = { x: e.clientX, y: e.clientY };
-  stamp(pointerLast.x, pointerLast.y);
-});
-canvas.addEventListener("pointermove", (e) => {
-  if (e.buttons === 0) return;
-  const p = { x: e.clientX, y: e.clientY };
-  if (pointerLast) wipeSegment(pointerLast, p);
-  pointerLast = p;
-});
-const dropPointer = () => { pointerLast = null; };
+canvas.addEventListener("pointerdown", (e) => { pointerDown = true; pointerPt = { x: e.clientX, y: e.clientY }; });
+canvas.addEventListener("pointermove", (e) => { if (pointerDown) pointerPt = { x: e.clientX, y: e.clientY }; });
+const dropPointer = () => { pointerDown = false; };
 canvas.addEventListener("pointerup", dropPointer);
 canvas.addEventListener("pointerleave", dropPointer);
 
 // ---- keys -------------------------------------------------------------------
 window.addEventListener("keydown", (e) => {
   if (e.code === "Space") { spaceDown = true; e.preventDefault(); }
-  if (e.key === "c" || e.key === "C") { ctx.globalCompositeOperation = "destination-out";
-    ctx.fillStyle = "rgba(0,0,0,1)"; ctx.fillRect(0, 0, w, h); }
+  if (e.key === "c" || e.key === "C") {               // wipe everything clear
+    maskCtx.globalCompositeOperation = "destination-out";
+    maskCtx.fillStyle = "rgba(0,0,0,1)";
+    maskCtx.fillRect(0, 0, w, h);
+  }
 });
 window.addEventListener("keyup", (e) => { if (e.code === "Space") spaceDown = false; });
 
