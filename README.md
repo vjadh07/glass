@@ -1,27 +1,44 @@
-# Glass — breath fog mirror
+# Glass
 
-A foggy-mirror toy in a single `index.html`. Your webcam is the reflection;
-breathe at your mic to fog the glass, then wipe and write on it with your
-fingertip (hand tracking). Inspired by "Glass" by nasha.natcha.
+A foggy mirror that runs in your browser. Your webcam is the mirror. You breathe at your mic and the glass fogs up. Then you point your finger at the camera and write on the fog, just like writing on a real bathroom window.
 
-## Run
+It is all in one HTML file. No frameworks and no build step.
 
-The camera needs a secure context, so serve it over `localhost` (opening the
-file directly with `file://` may block the camera in some browsers):
+## How to run it
 
-```sh
-cd ~/Projects/glass
-python3 -m http.server 8000
-```
+The browser only gives camera and mic access on a secure page, and localhost counts as secure. So you need to open it from a small local server instead of double clicking the file.
 
-Then open **http://localhost:8000** and click **Enter**. Allow camera + mic.
+1. Open a terminal in this folder.
+2. Start a simple server:
 
-## Use
-- **Breathe** at your mic — the glass fogs up.
-- **Move your finger** in front of the camera — wipe a clear streak / write.
-- **Mouse drag** also wipes (works even without a camera).
-- Hold **space** to fog if your mic isn't picking up your breath.
-- Press **c** to clear all fog.
+   ```
+   python3 -m http.server 8000
+   ```
 
-First load needs internet (MediaPipe hand model + scripts come from a CDN).
-Nothing leaves your device.
+3. Go to http://localhost:8000 in your browser.
+4. Click Enter and allow the camera and the mic.
+
+The first time you load it you need internet, because the hand tracking model is downloaded from a CDN. After that everything runs on your own computer and nothing is uploaded anywhere.
+
+## How to use it
+
+- Breathe at your mic and the glass fogs up.
+- Point your index finger at the camera and move it to write on the fog.
+- Curl your finger or drop your hand to stop writing.
+- You can also drag with the mouse to wipe, which works even without a camera.
+- Hold the space key to fog the glass if your mic is quiet.
+- Press the c key to clear everything.
+
+## Tech stack
+
+Everything is plain web tech, so there is nothing to install.
+
+- HTML, CSS and JavaScript for the whole page, all in one file.
+- getUserMedia to get the webcam video and the microphone audio.
+- Canvas 2D to draw the fog and erase it where you wipe. The fog is a blurred and brightened copy of your video with a frosted texture on top, and wiping reveals the sharp video underneath.
+- Web Audio API with an analyser node to read the mic. It checks how loud and how noisy the sound is, so a breath counts but normal talking mostly does not.
+- MediaPipe Hand Landmarker from Google for the hand tracking. It finds the points of your hand in each frame. I use the index fingertip to write, and I check the other fingers so it only writes when you are actually pointing.
+
+## Notes
+
+This was a fun project, so the breath detection is not perfect on every mic. If breathing does not fog it up, you can lower the sensitivity values at the top of the script in index.html, or just use the space key.
