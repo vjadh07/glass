@@ -87,7 +87,11 @@ const BREATH_REFOG   = 0.05;           // extra fog per frame at full breath
 const SPACE_REFOG    = 0.05;           // fog per frame while holding space
 
 // wiping
-const BRUSH_RADIUS   = 28;             // fingertip brush radius (css px)
+const BRUSH_DIAM     = 26;             // stroke width (css px) - keep it fingertip-sized
+const BRUSH_FEATHER  = 1.2;            // soft edge on the wipe (px of blur)
+const TIP_PROJECT    = 0.35;           // push the brush past landmark 8 to the very tip
+const SMOOTH_MINCUT  = 1.6;            // One Euro: lower = smoother but laggier
+const SMOOTH_BETA    = 0.02;           // One Euro: higher = more responsive when moving fast
 
 // breath detection
 const VOL_GATE       = 0.045;          // min RMS to count as breath
@@ -98,8 +102,7 @@ let w = 0, h = 0, dpr = 1;
 let handLandmarker = null;
 let lastVideoTime = -1;
 let handResult = null;
-let handLast = null;      // previous fingertip point (css px) while drawing
-let pointerDown = false, pointerPt = null, pointerLast = null;
+let pointerDown = false, pointerPt = null;
 let spaceDown = false;
 let breath = 0;           // smoothed breath intensity 0..1
 
@@ -173,26 +176,63 @@ function refogMask() {
   maskCtx.fillStyle = `rgba(255,255,255,${Math.min(a, 1)})`;
   maskCtx.fillRect(0, 0, w, h);
 }
-function wipeSegment(from, to) {
-  const dist = Math.hypot(to.x - from.x, to.y - from.y);
-  const steps = Math.max(1, Math.ceil(dist / (BRUSH_RADIUS * 0.35)));
-  for (let i = 0; i <= steps; i++) {
-    const t = i / steps;
-    stamp(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t);
+// One Euro filter: smooths the noisy fingertip without adding much lag.
+function lowpass(prev, x, a) { return a * x + (1 - a) * prev; }
+function smoothAlpha(cutoff, dt) { const tau = 1 / (2 * Math.PI * cutoff); return 1 / (1 + tau / dt); }
+class OneEuro {
+  constructor(minCutoff, beta, dCutoff = 1) {
+    this.minCutoff = minCutoff; this.beta = beta; this.dCutoff = dCutoff;
+    this.xPrev = null; this.dxPrev = 0; this.tPrev = 0;
+  }
+  reset() { this.xPrev = null; this.dxPrev = 0; }
+  filter(x, t) {
+    if (this.xPrev === null) { this.xPrev = x; this.tPrev = t; return x; }
+    const dt = Math.max(1e-3, (t - this.tPrev) / 1000);
+    this.tPrev = t;
+    const dx = (x - this.xPrev) / dt;
+    const dxHat = lowpass(this.dxPrev, dx, smoothAlpha(this.dCutoff, dt));
+    this.dxPrev = dxHat;
+    const cutoff = this.minCutoff + this.beta * Math.abs(dxHat);
+    const xHat = lowpass(this.xPrev, x, smoothAlpha(cutoff, dt));
+    this.xPrev = xHat;
+    return xHat;
   }
 }
-function stamp(x, y) {
-  // erase the mask with a soft-edged brush -> feathered, premium wipe
-  const g = maskCtx.createRadialGradient(x, y, 0, x, y, BRUSH_RADIUS);
-  g.addColorStop(0,    "rgba(0,0,0,1)");
-  g.addColorStop(0.6,  "rgba(0,0,0,0.9)");
-  g.addColorStop(1,    "rgba(0,0,0,0)");
-  maskCtx.globalCompositeOperation = "destination-out";
-  maskCtx.fillStyle = g;
-  maskCtx.beginPath();
-  maskCtx.arc(x, y, BRUSH_RADIUS, 0, Math.PI * 2);
-  maskCtx.fill();
+
+// A "pen" erases the mask as one continuous, smooth stroke (quadratic curves
+// through the midpoints), so there are no lumpy stacked blobs.
+function makePen() {
+  return { active: false, prevPt: null, prevMid: null,
+           fx: new OneEuro(SMOOTH_MINCUT, SMOOTH_BETA), fy: new OneEuro(SMOOTH_MINCUT, SMOOTH_BETA) };
 }
+function beginErase() {
+  maskCtx.globalCompositeOperation = "destination-out";
+  maskCtx.strokeStyle = maskCtx.fillStyle = "rgba(0,0,0,1)";  // full erase = no cross-frame buildup
+  maskCtx.lineWidth = BRUSH_DIAM;
+  maskCtx.lineCap = maskCtx.lineJoin = "round";
+  maskCtx.filter = `blur(${BRUSH_FEATHER}px)`;                 // soft edge
+}
+function penStroke(pen, x, y) {
+  if (!pen.active) {                                           // pen down: a single round dot
+    pen.active = true; pen.prevPt = { x, y }; pen.prevMid = { x, y };
+    beginErase();
+    maskCtx.beginPath(); maskCtx.arc(x, y, BRUSH_DIAM / 2, 0, Math.PI * 2); maskCtx.fill();
+    maskCtx.filter = "none";
+    return;
+  }
+  const mid = { x: (pen.prevPt.x + x) / 2, y: (pen.prevPt.y + y) / 2 };
+  beginErase();
+  maskCtx.beginPath();
+  maskCtx.moveTo(pen.prevMid.x, pen.prevMid.y);
+  maskCtx.quadraticCurveTo(pen.prevPt.x, pen.prevPt.y, mid.x, mid.y);
+  maskCtx.stroke();
+  maskCtx.filter = "none";
+  pen.prevPt = { x, y }; pen.prevMid = mid;
+}
+function penUp(pen) { pen.active = false; pen.prevPt = pen.prevMid = null; pen.fx.reset(); pen.fy.reset(); }
+
+const handPen = makePen();
+const pointerPen = makePen();
 
 // ---- fog appearance + composite ---------------------------------------------
 function coverDrawMirrored(dctx, vid, dw, dh) {
@@ -293,31 +333,36 @@ function updateBreath() {
 
 // ---- main loop --------------------------------------------------------------
 function loop() {
+  let freshHand = false;
   if (handLandmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
     lastVideoTime = video.currentTime;
-    try { handResult = handLandmarker.detectForVideo(video, performance.now()); }
+    try { handResult = handLandmarker.detectForVideo(video, performance.now()); freshHand = true; }
     catch (e) { /* transient frame errors are fine */ }
   }
 
   updateBreath();
   refogMask();                                        // add fog first...
 
-  // ...then wipe, so the stroke stays clear this frame
-  let handPt = null;
-  if (handResult && handResult.landmarks && handResult.landmarks.length) {
-    const lm = handResult.landmarks[0];
-    if (isPointing(lm)) {
-      const tip = lm[8];                              // index fingertip, mirrored
-      handPt = { x: (1 - tip.x) * w, y: tip.y * h };
+  // ...then wipe, so the stroke stays clear this frame.
+  // Act only on a fresh detection so the One Euro filter sees real timing.
+  if (freshHand) {
+    const hand = handResult && handResult.landmarks && handResult.landmarks[0];
+    if (hand && isPointing(hand)) {
+      // map index tip (8) and dip (7) to mirrored screen space, then push the
+      // brush a little past the tip so it sits at the very fingertip
+      const sx8 = (1 - hand[8].x) * w, sy8 = hand[8].y * h;
+      const sx7 = (1 - hand[7].x) * w, sy7 = hand[7].y * h;
+      const tipX = sx8 + (sx8 - sx7) * TIP_PROJECT;
+      const tipY = sy8 + (sy8 - sy7) * TIP_PROJECT;
+      const t = performance.now();
+      penStroke(handPen, handPen.fx.filter(tipX, t), handPen.fy.filter(tipY, t));
+    } else {
+      penUp(handPen);                                 // lift the pen when not pointing
     }
   }
-  if (handPt) { if (handLast) wipeSegment(handLast, handPt); else stamp(handPt.x, handPt.y); handLast = handPt; }
-  else handLast = null;
 
-  if (pointerDown && pointerPt) {
-    if (pointerLast) wipeSegment(pointerLast, pointerPt); else stamp(pointerPt.x, pointerPt.y);
-    pointerLast = pointerPt;
-  } else pointerLast = null;
+  if (pointerDown && pointerPt) penStroke(pointerPen, pointerPt.x, pointerPt.y);
+  else if (pointerPen.active) penUp(pointerPen);
 
   compose();
   requestAnimationFrame(loop);
